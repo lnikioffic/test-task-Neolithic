@@ -29,7 +29,7 @@ python -m ipykernel install --user --name .venv --display-name "Python (.venv)"
 uv run python -m ipykernel install --user --name .venv --display-name "Python (.venv)"
 ```
 
-## Перове задание
+## Первое задание
 
 ### Сводная таблица с общим количеством активных объектов за каждый день рассматриваемого периода.
 ![Сводная таблица с общим количеством активных объектов за каждый день рассматриваемого периода](assets/table.png)

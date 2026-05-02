@@ -1,97 +1,25 @@
 # %% Cell 1
-import re
-import uuid
-from datetime import UTC, datetime
+import datetime
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
-from pandas import DataFrame
-from selectolax.lexbor import LexborHTMLParser
 
-
-# %% Parser
-def parse_page(url: str) -> tuple[list[dict], bool]:
-    response = requests.get(url)
-    tree = LexborHTMLParser(response.text)
-    has_next = bool(tree.css_first('.search-result__more'))
-
-    cards = tree.css('.search-result__list-item')
-    results = []
-
-    for card in cards:
-        data_link = card.css_first('[data-rooms]')
-
-        id = uuid.uuid4()
-        advert_id = data_link.attributes.get('data-id', '')
-        domain = 't-dsk.ru'
-        developer = 'ТДСК'
-
-        flat_number = data_link.attributes.get('data-number', '')
-        flat_number = int(flat_number) if flat_number else 0
-        floor = data_link.attributes.get('data-floor', '')
-        floor = int(floor) if floor else 0
-        room_count = data_link.attributes.get('data-rooms', '')
-        room_count = int(room_count) if room_count else 0
-
-        price_sale = data_link.attributes.get('data-price-sale', '')
-        price_sale = int(price_sale.replace(' ', '')) if price_sale else 0
-
-        flat_room_block = card.css_first('.search-result__object-top')
-        flat_room = flat_room_block.text(strip=True)
-        street_block = card.css_first('.search-result__object-bottom')
-        street_text = street_block.text(strip=True)
-        street = re.sub(r'(ГП-[\d.]+)', r'(\1)', street_text)
-
-        tds = card.css('.search-result__td')
-        td_texts = [td.text(strip=True) for td in tds]
-        entrance_number = td_texts[1] if len(td_texts) > 1 else ''
-        addres = f'{street}, подъезд {entrance_number}, квартира № {flat_number}'
-
-        description = f'{flat_room} на {street_text} {entrance_number} подъезд'
-
-        match = re.search(r'ГП-\d+\.\d+', street_text)
-        gp = match.group() if match else ''
-
-        area_block = card.css_first('.search-result__td.square')
-        area = float(area_block.text(strip=True).split()[0].replace(',', '.'))
-
-        results.append({
-            'id': id,
-            'advert_id': advert_id,
-            'domain': domain,
-            'developer': developer,
-            'address': addres,
-            'gp': gp,
-            'description': description,
-            'entrance_number': entrance_number,
-            'floor': floor,
-            'area': area,
-            'room_count': room_count,
-            'flat_number': flat_number,
-            'price': price_sale,
-            'published_at': datetime.now(UTC).date(),
-            'actualized_at': datetime.now(UTC).date(),
-        })
-    return results, has_next
-
-
-def run_parse_all_pages(url: str):
-    i = 1
-    all_data = []
-    has_next = True
-    while has_next:
-        url = f'{url}&PAGEN_3={i}'
-        i += 1
-        result, has_next = parse_page(url)
-        print(f'Страница {i - 1}: {len(result)} квартир, есть ещё: {has_next}')
-        all_data.extend(result)
-    return all_data
+from parser import run_parse_all_pages
 
 
 # %%
 class TDSKExposition:
-    def __init__(self, path_csv: str | None = None, df: DataFrame | None = None) -> None:
+    def __init__(
+        self,
+        path_csv: str | None = None,
+        df: pd.DataFrame | None = None,
+    ) -> None:
+        """Инициализирует объект с данными из Excel или DataFrame.
+
+        :param path_csv: Путь к Excel файлу.
+        :param df: DataFrame с данными.
+        :return: None
+        """
         if df is not None:
             self.df = df
             return
@@ -114,7 +42,12 @@ class TDSKExposition:
         ).dt.date
         self.df['area'] = pd.to_numeric(self.df['area'], errors='coerce')
 
-    def extract_building(self):
+    def extract_building(self) -> TDSKExposition:
+        """Извлекает название корпуса из адреса.
+
+        :return: Новый объект TDSKExcerpt с добавленным полем building.
+        :rtype: TDSKExposition
+        """
         new = self.df.copy()
         cleaned_addres = (
             new['address']
@@ -126,7 +59,12 @@ class TDSKExposition:
         new['building'] = cleaned_addres
         return TDSKExposition(df=new)
 
-    def expand_date_range(self):
+    def expand_date_range(self) -> TDSKExposition:
+        """Расширяет данные, создавая записи для каждого дня экспозиции.
+
+        :return: Новый объект с раскрытым диапазоном дат.
+        :rtype: TDSKExposition
+        """
         new = self.df.copy()
         new['date_range'] = new.apply(
             lambda row: pd.date_range(row['published_at'], row['actualized_at'], freq='D'),
@@ -135,7 +73,18 @@ class TDSKExposition:
         new = new.explode('date_range')
         return TDSKExposition(df=new)
 
-    def get_active_pivot_report(self, start_date, end_date):
+    def get_active_pivot_report(
+        self,
+        start_date: datetime.datetime,
+        end_date: datetime.datetime,
+    ) -> pd.DataFrame:
+        """Формирует отчёт по активным квартирам за период.
+
+        :param start_date: Начальная дата периода.
+        :param end_date: Конечная дата периода.
+        :return: DataFrame с отчётом.
+        :rtype: pd.DataFrame
+        """
         mask = (self.df['date_range'] >= start_date) & (self.df['date_range'] <= end_date)
         df_filtered = self.df.loc[mask]
 
@@ -145,7 +94,11 @@ class TDSKExposition:
         report = report.sort_values(['Дата', 'Корпус'])
         return report
 
-    def plot_monthly_rooms(self):
+    def plot_monthly_rooms(self) -> None:
+        """Строит столбчатую диаграмму динамики активных объектов по комнатности по месяцам.
+
+        :return: None
+        """
         self.df['month'] = self.df['date_range'].dt.to_period('M').astype(str)
         monthly_data = (
             self.df.groupby(['month', 'room_count'])['id'].nunique().unstack(fill_value=0)
@@ -162,13 +115,24 @@ class TDSKExposition:
 
         plt.show()
 
-    def union(self, new_df: DataFrame, tags: list[str]):
+    def union(self, new_df: pd.DataFrame, tags: list[str]) -> TDSKExposition:
+        """Объединяет текущий датасет с новым, добавляя метку источника данных.
+
+        :param new_df: Новый DataFrame для объединения.
+        :param tags: Метки для старых и новых данных [старые, новые].
+        :return: Объединённый объект TDSKExposition.
+        :rtype: TDSKExposition
+        """
         self.df['dataset'] = tags[0]
         new_df['dataset'] = tags[1]
         combined = pd.concat([self.df, new_df], ignore_index=True)
         return TDSKExposition(df=combined)
 
-    def plot_rooms_distribution(self):
+    def plot_rooms_distribution(self) -> None:
+        """Строит столбчатую диаграмму количества квартир по комнатности (old vs new).
+
+        :return: None
+        """
         data = (
             self.df
             .groupby(['room_count', 'dataset'])['advert_id']
@@ -187,7 +151,11 @@ class TDSKExposition:
         plt.tight_layout()
         plt.show()
 
-    def plot_diff_area(self):
+    def plot_diff_area(self) -> None:
+        """Строит столбчатую диаграмму распределения квартир по площади (old vs new).
+
+        :return: None
+        """
         bins = [0, 20, 30, 40, 50, 60, 70, 80, 90, 100, float('inf')]
         labels = [
             '<20',
@@ -204,7 +172,7 @@ class TDSKExposition:
 
         df = self.df.copy()
         df['area_bin'] = pd.cut(df['area'], bins=bins, labels=labels, right=False)
-        
+
         data = df.groupby(['area_bin', 'dataset'])['advert_id'].nunique().unstack(fill_value=0)
         data.columns = ['Старые данные', 'Новые данные']
         data.plot(kind='bar', figsize=(12, 5))
@@ -218,7 +186,11 @@ class TDSKExposition:
         plt.tight_layout()
         plt.show()
 
-    def plot_diff_price(self):
+    def plot_diff_price(self) -> None:
+        """Строит столбчатую диаграмму распределения квартир по цене (old vs new).
+
+        :return: None
+        """
         bins = [0, 4e6, 5e6, 6e6, 7e6, 8e6, float('inf')]
         labels = ['<4', '4-5', '5-6', '6-7', '7-8', '>8']
 
@@ -237,7 +209,12 @@ class TDSKExposition:
         plt.tight_layout()
         plt.show()
 
-    def save_csv(self, filename):
+    def save_csv(self, filename: str) -> None:
+        """Сохраняет данные DataFrame в CSV файл.
+
+        :param filename: Имя файла для сохранения.
+        :return: None
+        """
         df = self.df.copy()
         df['published_at'] = df['published_at'].astype(str)
         df['actualized_at'] = df['actualized_at']
@@ -248,8 +225,8 @@ class TDSKExposition:
 # %%
 exposition = TDSKExposition('Экспозиция ТДСК с 01.07.2023 по 31.12.2023.xlsx')
 print(len(exposition.df))
-start = pd.Timestamp('2023-07-01')
-end = pd.Timestamp('2023-12-31')
+start = datetime.datetime(2023, 7, 1, tzinfo=datetime.UTC)
+end = datetime.datetime(2023, 12, 31, tzinfo=datetime.UTC)
 pivot = exposition.extract_building().expand_date_range().get_active_pivot_report(start, end)
 print(pivot)
 exposition.extract_building().expand_date_range().plot_monthly_rooms()
