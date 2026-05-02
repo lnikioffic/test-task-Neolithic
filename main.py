@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
+from pandas import DataFrame
 from selectolax.lexbor import LexborHTMLParser
 
 
 # %% Parser
 def parse_page(url: str) -> tuple[list[dict], bool]:
-    print(url)
     response = requests.get(url)
     tree = LexborHTMLParser(response.text)
     has_next = bool(tree.css_first('.search-result__more'))
@@ -28,8 +28,11 @@ def parse_page(url: str) -> tuple[list[dict], bool]:
         developer = 'ТДСК'
 
         flat_number = data_link.attributes.get('data-number', '')
+        flat_number = int(flat_number) if flat_number else 0
         floor = data_link.attributes.get('data-floor', '')
+        floor = int(floor) if floor else 0
         room_count = data_link.attributes.get('data-rooms', '')
+        room_count = int(room_count) if room_count else 0
 
         price_sale = data_link.attributes.get('data-price-sale', '')
         price_sale = int(price_sale.replace(' ', '')) if price_sale else 0
@@ -73,29 +76,30 @@ def parse_page(url: str) -> tuple[list[dict], bool]:
     return results, has_next
 
 
-def run_all_pages(url: str):
+def run_parse_all_pages(url: str):
     i = 1
     all_data = []
     has_next = True
     while has_next:
-        url = f'https://www.t-dsk.ru/buildings/search-apartments/?objects=all&PAGEN_3={i}'
+        url = f'{url}&PAGEN_3={i}'
         i += 1
         result, has_next = parse_page(url)
-        print(len(result), has_next)
+        print(f'Страница {i - 1}: {len(result)} квартир, есть ещё: {has_next}')
         all_data.extend(result)
     return all_data
 
 
-print(run_all_pages('as'))
-
-
 # %%
 class TDSKExposition:
-    def __init__(self, path_csv) -> None:
+    def __init__(self, path_csv: str | None = None, df: DataFrame | None = None) -> None:
+        if df is not None:
+            self.df = df
+            return
+
         self.df = pd.read_excel(
             path_csv,
             engine='openpyxl',
-            parse_dates=['actualized_at'],
+            parse_dates=['published_at', 'actualized_at'],
         )
 
         self.df['actualized_at'] = pd.to_datetime(
@@ -108,29 +112,32 @@ class TDSKExposition:
             format='ISO8601',
             utc=True,
         ).dt.date
+        self.df['area'] = pd.to_numeric(self.df['area'], errors='coerce')
 
     def extract_building(self):
+        new = self.df.copy()
         cleaned_addres = (
-            self
-            .df['address']
+            new['address']
             .str.split('(', expand=True)[0]
             .str.split('подъезд', expand=True)[0]
             .str.strip()
             .str.rstrip(',')
         )
-        self.df['building'] = cleaned_addres
+        new['building'] = cleaned_addres
+        return TDSKExposition(df=new)
 
-    def get_active_pivot_report(self, start_date, end_date):
-        self.df['date_range'] = self.df.apply(
+    def expand_date_range(self):
+        new = self.df.copy()
+        new['date_range'] = new.apply(
             lambda row: pd.date_range(row['published_at'], row['actualized_at'], freq='D'),
             axis=1,
         )
-        self.df_expanded = self.df.explode('date_range')
+        new = new.explode('date_range')
+        return TDSKExposition(df=new)
 
-        mask = (self.df_expanded['date_range'] >= start_date) & (
-            self.df_expanded['date_range'] <= end_date
-        )
-        df_filtered = self.df_expanded.loc[mask]
+    def get_active_pivot_report(self, start_date, end_date):
+        mask = (self.df['date_range'] >= start_date) & (self.df['date_range'] <= end_date)
+        df_filtered = self.df.loc[mask]
 
         report = df_filtered.groupby(['date_range', 'building'])['id'].nunique().reset_index()
         report.columns = ['Дата', 'Корпус', 'Кол-во активных квартир']
@@ -139,13 +146,12 @@ class TDSKExposition:
         return report
 
     def plot_monthly_rooms(self):
-        df = self.df_expanded.copy()
+        self.df['month'] = self.df['date_range'].dt.to_period('M').astype(str)
+        monthly_data = (
+            self.df.groupby(['month', 'room_count'])['id'].nunique().unstack(fill_value=0)
+        )
 
-        df['month'] = df['date_range'].dt.to_period('M').astype(str)
-        monthly_data = df.groupby(['month', 'room_count'])['id'].nunique().unstack(fill_value=0)
-
-        plt.figure(figsize=(12, 6))
-        monthly_data.plot(kind='bar', ax=plt.gca())
+        monthly_data.plot(kind='bar', figsize=(12, 5))
 
         plt.title('Динамика активных объектов по комнатности (по месяцам)', fontsize=14)
         plt.xlabel('Месяц', fontsize=12)
@@ -156,17 +162,108 @@ class TDSKExposition:
 
         plt.show()
 
+    def union(self, new_df: DataFrame, tags: list[str]):
+        self.df['dataset'] = tags[0]
+        new_df['dataset'] = tags[1]
+        combined = pd.concat([self.df, new_df], ignore_index=True)
+        return TDSKExposition(df=combined)
+
+    def plot_rooms_distribution(self):
+        data = (
+            self.df
+            .groupby(['room_count', 'dataset'])['advert_id']
+            .nunique()
+            .unstack(fill_value=0)
+            .sort_index()
+        )
+        data.columns = ['Старые данные', 'Новые данные']
+        data.plot(kind='bar', figsize=(10, 5))
+
+        plt.title('Количество квартир по комнатам (старая vs новая)')
+        plt.xlabel('Комнатность')
+        plt.ylabel('Количество квартир')
+        plt.legend(title='Новизна', bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_diff_area(self):
+        bins = [0, 20, 30, 40, 50, 60, 70, 80, 90, 100, float('inf')]
+        labels = [
+            '<20',
+            '20-30',
+            '30-40',
+            '40-50',
+            '50-60',
+            '60-70',
+            '70-80',
+            '80-90',
+            '90-100',
+            '>100',
+        ]
+
+        df = self.df.copy()
+        df['area_bin'] = pd.cut(df['area'], bins=bins, labels=labels, right=False)
+        
+        data = df.groupby(['area_bin', 'dataset'])['advert_id'].nunique().unstack(fill_value=0)
+        data.columns = ['Старые данные', 'Новые данные']
+        data.plot(kind='bar', figsize=(12, 5))
+
+        plt.title('Распределение по площади (старая vs новая)')
+        plt.xlabel('Площадь')
+        plt.ylabel('Количество квартир')
+        plt.legend(title='Новизна', bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_diff_price(self):
+        bins = [0, 4e6, 5e6, 6e6, 7e6, 8e6, float('inf')]
+        labels = ['<4', '4-5', '5-6', '6-7', '7-8', '>8']
+
+        df = self.df.copy()
+        df['price_bin'] = pd.cut(df['price'], bins=bins, labels=labels, right=False)
+
+        data = df.groupby(['price_bin', 'dataset'])['advert_id'].nunique().unstack(fill_value=0)
+        data.columns = ['Старые данные', 'Новые данные']
+        data.plot(kind='bar', figsize=(12, 5))
+
+        plt.title('Распределение по цене (старая vs новая)')
+        plt.xlabel('Цена (млн)')
+        plt.ylabel('Количество квартир')
+        plt.legend(title='Новизна', bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.show()
+
+    def save_csv(self, filename):
+        df = self.df.copy()
+        df['published_at'] = df['published_at'].astype(str)
+        df['actualized_at'] = df['actualized_at']
+        df.to_csv(filename, index=False, encoding='cp1251')
+        print(f'Data saved to {filename}')
+
 
 # %%
-def main():
-    exposition = TDSKExposition('Экспозиция ТДСК с 01.07.2023 по 31.12.2023.xlsx')
-    exposition.extract_building()
-    start = pd.Timestamp('2023-07-01')
-    end = pd.Timestamp('2023-12-31')
-    pivot = exposition.get_active_pivot_report(start, end)
-    print(pivot)
-    exposition.plot_monthly_rooms()
+exposition = TDSKExposition('Экспозиция ТДСК с 01.07.2023 по 31.12.2023.xlsx')
+print(len(exposition.df))
+start = pd.Timestamp('2023-07-01')
+end = pd.Timestamp('2023-12-31')
+pivot = exposition.extract_building().expand_date_range().get_active_pivot_report(start, end)
+print(pivot)
+exposition.extract_building().expand_date_range().plot_monthly_rooms()
 
+# %%
+new_data = run_parse_all_pages('https://www.t-dsk.ru/buildings/search-apartments/?objects=all&')
+new_df = pd.DataFrame(new_data)
 
-if __name__ == '__main__':
-    main()
+# %%
+exposition_new = exposition.union(new_df, ['old', 'new'])
+# print(exposition_new.df.head())
+# print(exposition_new.df.nunique())
+# print(len(exposition_new.df))
+exposition_new.plot_rooms_distribution()
+exposition_new.plot_diff_area()
+exposition_new.plot_diff_price()
+exposition_new.save_csv('updated.csv')
